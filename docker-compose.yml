@@ -1,0 +1,198 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.16.1
+    container_name: excel-assistant-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    container_name: excel-assistant-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_DATABASE=excel_assistant
+      - MYSQL_USER=excel_user
+      - MYSQL_PASSWORD=excel_password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot_password --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-04-22T22-12-26Z}
+    container_name: excel-assistant-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: excel-assistant-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+#  backend:
+#    build:
+#      context: .
+#      dockerfile: backend/Dockerfile
+#      args:
+#        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-public.ecr.aws/docker/library/python:3.12-slim}
+#    container_name: excel-assistant-backend
+#    environment:
+#      - ELASTICSEARCH_URL=http://elasticsearch:9200
+#      - DATA_DIR=/app/data
+#      - STORAGE_DIR=/app/storage
+#      - RAW_DIR=/app/storage/raw
+#      - PARQUET_DIR=/app/storage/parquet
+#      - DUCKDB_PATH=/app/storage/duckdb/excel_assistant.duckdb
+#      - METADATA_PATH=/app/storage/metadata.json
+#      - MYSQL_HOST=mysql
+#      - MYSQL_PORT=3306
+#      - MYSQL_USER=excel_user
+#      - MYSQL_PASSWORD=excel_password
+#      - MYSQL_DATABASE=excel_assistant
+#      - MINIO_ENDPOINT=minio:9000
+#      - MINIO_ACCESS_KEY=minioadmin
+#      - MINIO_SECRET_KEY=minioadmin
+#      - MINIO_BUCKET=excel-files
+#      - CELERY_BROKER_URL=redis://redis:6379/0
+#      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+#      - TABLE_ARTIFACT_PREFIX=${TABLE_ARTIFACT_PREFIX:-table-artifacts}
+#      - ENABLE_LLM_ANSWER=${ENABLE_LLM_ANSWER:-false}
+#      - ENABLE_LLM_TABLE_PARSE=${ENABLE_LLM_TABLE_PARSE:-false}
+#      - ENABLE_SYMBOLIC_CODE_QA=${ENABLE_SYMBOLIC_CODE_QA:-false}
+#      - ASTRA_PARSE_MODE=${ASTRA_PARSE_MODE:-enhanced}
+#      - ASTRA_ARTIFACT_PREFIX=${ASTRA_ARTIFACT_PREFIX:-astra-artifacts}
+#      - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
+#      - LLM_BASE_URL=${LLM_BASE_URL:-}
+#      - LLM_API_KEY=${LLM_API_KEY:-}
+#      - LLM_MODEL=${LLM_MODEL:-}
+#      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.2}
+#      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-300}
+#      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-hash}
+#      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
+#      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+#      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
+#      - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-384}
+#    ports:
+#      - "8000:8000"
+#    volumes:
+#      - ./data:/app/data
+#      - ./storage:/app/storage
+#      - ./backend:/app/backend
+#    depends_on:
+#      elasticsearch:
+#        condition: service_healthy
+#      mysql:
+#        condition: service_healthy
+#      minio:
+#        condition: service_healthy
+#      redis:
+#        condition: service_healthy
+#
+#  celery-worker:
+#    build:
+#      context: .
+#      dockerfile: backend/Dockerfile
+#      args:
+#        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-public.ecr.aws/docker/library/python:3.12-slim}
+#    container_name: excel-assistant-celery-worker
+#    command: celery -A app.celery_app.celery_app worker --loglevel=info --concurrency=${TABLE_PIPELINE_WORKERS:-1}
+#    environment:
+#      - ELASTICSEARCH_URL=http://elasticsearch:9200
+#      - ELASTICSEARCH_VERIFY_CERTS=false
+#      - DATA_DIR=/app/data
+#      - STORAGE_DIR=/app/storage
+#      - RAW_DIR=/app/storage/raw
+#      - PARQUET_DIR=/app/storage/parquet
+#      - DUCKDB_PATH=/app/storage/duckdb/excel_assistant.duckdb
+#      - METADATA_PATH=/app/storage/metadata.json
+#      - MYSQL_HOST=mysql
+#      - MYSQL_PORT=3306
+#      - MYSQL_USER=excel_user
+#      - MYSQL_PASSWORD=excel_password
+#      - MYSQL_DATABASE=excel_assistant
+#      - MINIO_ENDPOINT=minio:9000
+#      - MINIO_ACCESS_KEY=minioadmin
+#      - MINIO_SECRET_KEY=minioadmin
+#      - MINIO_BUCKET=excel-files
+#      - CELERY_BROKER_URL=redis://redis:6379/0
+#      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+#      - TABLE_ARTIFACT_PREFIX=${TABLE_ARTIFACT_PREFIX:-table-artifacts}
+#      - LLM_BASE_URL=${LLM_BASE_URL:-}
+#      - LLM_API_KEY=${LLM_API_KEY:-}
+#      - LLM_MODEL=${LLM_MODEL:-}
+#      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.2}
+#      - LLM_TIMEOUT_SECONDS=${LLM_TIMEOUT_SECONDS:-300}
+#      - EMBEDDING_BASE_URL=${EMBEDDING_BASE_URL:-}
+#      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY:-}
+#      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-}
+#      - EMBEDDING_DIMENSIONS=${EMBEDDING_DIMENSIONS:-384}
+#    volumes:
+#      - ./data:/app/data
+#      - ./storage:/app/storage
+#      - ./backend:/app/backend
+#    depends_on:
+#      elasticsearch:
+#        condition: service_healthy
+#      minio:
+#        condition: service_healthy
+#      redis:
+#        condition: service_healthy
+#
+#  frontend:
+#    build:
+#      context: .
+#      dockerfile: frontend/Dockerfile
+#      args:
+#        NODE_BASE_IMAGE: ${NODE_BASE_IMAGE:-public.ecr.aws/docker/library/node:22-alpine}
+#    container_name: excel-assistant-frontend
+#    environment:
+#      - VITE_API_BASE_URL=
+#    ports:
+#      - "5173:5173"
+#    volumes:
+#      - ./frontend:/app/frontend
+#      - /app/frontend/node_modules
+#    depends_on:
+#      - backend
+
+volumes:
+  es_data:
+  mysql_data:
+  minio_data:
+  redis_data:

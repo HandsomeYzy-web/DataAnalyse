@@ -21,7 +21,7 @@ class TableSearchIndex:
         self.embedding_model = settings.embedding_model
 
     def index_table(self, document: dict[str, Any]) -> dict[str, Any]:
-        vector = self.embed_text(document["summary_text"])
+        vector = self.embed_text(_document_search_text(document))
         self.ensure_index(vector_dims=len(vector) if vector else None)
 
         indexed_document = dict(document)
@@ -85,6 +85,10 @@ class TableSearchIndex:
             "candidate_fields": {"type": "keyword"},
             "normalized_headers": {"type": "text"},
             "hierarchy_definition": {"type": "text"},
+            "tree_path_text": {"type": "text"},
+            "tree_leaf_text": {"type": "text"},
+            "tree_metric_names": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "tree_search_text": {"type": "text"},
             "source_object": {"type": "keyword"},
             "xlsx_object": {"type": "keyword"},
             "tree_object": {"type": "keyword"},
@@ -105,9 +109,18 @@ class TableSearchIndex:
             )
             return
 
+        mapping = self.client.indices.get_mapping(index=self.index_name)
+        index_mapping = mapping[self.index_name]["mappings"].get("properties", {})
+        missing_properties = {
+            key: value for key, value in properties.items() if key not in index_mapping
+        }
+        if missing_properties:
+            self.client.indices.put_mapping(
+                index=self.index_name,
+                properties=missing_properties,
+            )
+
         if vector_dims:
-            mapping = self.client.indices.get_mapping(index=self.index_name)
-            index_mapping = mapping[self.index_name]["mappings"].get("properties", {})
             if "summary_vector" not in index_mapping:
                 self.client.indices.put_mapping(
                     index=self.index_name,
@@ -146,10 +159,14 @@ class TableSearchIndex:
                 "multi_match": {
                     "query": question,
                     "fields": [
+                        "tree_metric_names^6",
+                        "tree_path_text^5",
                         "table_title^4",
                         "summary_text^3",
+                        "tree_leaf_text^3",
                         "filename^2",
                         "sheet_name^2",
+                        "candidate_fields^2",
                         "normalized_headers",
                         "hierarchy_definition",
                     ],
@@ -189,18 +206,148 @@ def build_table_summary(
     normalized_headers: str,
     hierarchy_definition: str,
     summary_text: str,
+    tree: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    tree_fields = build_tree_index_fields(tree or {})
     candidate_fields = _dedupe_strings(
         [
             *_extract_candidate_fields(normalized_headers),
             *_extract_candidate_fields(hierarchy_definition),
+            *tree_fields["tree_metric_names"],
+        ]
+    )
+    indexed_summary = _append_metrics_to_summary(summary_text, candidate_fields)
+    return {
+        "summary_text": indexed_summary,
+        "candidate_fields": candidate_fields,
+        **tree_fields,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def build_tree_index_fields(tree: dict[str, Any]) -> dict[str, list[str] | str]:
+    path_texts: list[str] = []
+    leaf_texts: list[str] = []
+    metric_names: list[str] = []
+
+    def walk(node: Any, path: list[str]) -> None:
+        if len(path_texts) >= 2000:
+            return
+
+        if isinstance(node, dict):
+            if node and all(not isinstance(value, dict) for value in node.values()):
+                _append_tree_index_record(
+                    path=path,
+                    data=node,
+                    path_texts=path_texts,
+                    leaf_texts=leaf_texts,
+                    metric_names=metric_names,
+                )
+                return
+            for key, value in node.items():
+                walk(value, [*path, str(key)])
+            return
+
+        _append_tree_index_record(
+            path=path,
+            data=node,
+            path_texts=path_texts,
+            leaf_texts=leaf_texts,
+            metric_names=metric_names,
+        )
+
+    walk(tree, [])
+    deduped_paths = _dedupe_strings(path_texts, limit=2000)
+    deduped_leafs = _dedupe_strings(leaf_texts, limit=2000)
+    deduped_metrics = _dedupe_strings(metric_names, limit=300)
+    tree_search_text = "\n".join(
+        [
+            "树路径：",
+            *deduped_paths[:400],
+            "树叶子数据：",
+            *deduped_leafs[:400],
+            "树指标：",
+            "、".join(deduped_metrics),
         ]
     )
     return {
-        "summary_text": summary_text.strip(),
-        "candidate_fields": candidate_fields,
-        "created_at": datetime.now(UTC).isoformat(),
+        "tree_path_text": deduped_paths,
+        "tree_leaf_text": deduped_leafs,
+        "tree_metric_names": deduped_metrics,
+        "tree_search_text": tree_search_text,
     }
+
+
+def _append_tree_index_record(
+    path: list[str],
+    data: Any,
+    path_texts: list[str],
+    leaf_texts: list[str],
+    metric_names: list[str],
+) -> None:
+    path_text = " | ".join(path)
+    leaf_text = _leaf_to_text(data)
+    if path_text:
+        path_texts.append(path_text)
+        metric_names.extend(_extract_metric_names_from_text(path_text))
+    if leaf_text:
+        leaf_texts.append(leaf_text)
+        metric_names.extend(_extract_metric_names_from_text(leaf_text))
+    if isinstance(data, dict):
+        for key in data.keys():
+            metric_names.extend(_extract_metric_names_from_text(str(key)))
+
+
+def _leaf_to_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return "; ".join(f"{key}={item}" for key, item in value.items())
+    return str(value)
+
+
+def _extract_metric_names_from_text(text: str) -> list[str]:
+    values: list[str] = []
+    for part in re.split(r"[|;；,，:：=]+", text):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        values.append(cleaned)
+        if " - " in cleaned:
+            values.extend(item.strip() for item in cleaned.split(" - ") if item.strip())
+    return [
+        value
+        for value in values
+        if 1 < len(value) <= 100 and not re.fullmatch(r"[\d.\-]+", value)
+    ]
+
+
+def _document_search_text(document: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in [
+        "table_title",
+        "filename",
+        "sheet_name",
+        "summary_text",
+        "tree_search_text",
+    ]:
+        value = document.get(key)
+        if value:
+            parts.append(str(value))
+    fields = document.get("candidate_fields") or []
+    if fields:
+        parts.append("指标：" + "、".join(str(item) for item in fields[:120]))
+    return "\n".join(parts)
+
+
+def _append_metrics_to_summary(summary_text: str, candidate_fields: list[str]) -> str:
+    summary = summary_text.strip()
+    metrics = _dedupe_strings(candidate_fields, limit=80)
+    if not metrics:
+        return summary
+
+    metric_text = "、".join(metrics)
+    if summary:
+        return f"{summary}\n\n指标：{metric_text}"
+    return f"指标：{metric_text}"
 
 
 def _extract_candidate_fields(text: str) -> list[str]:

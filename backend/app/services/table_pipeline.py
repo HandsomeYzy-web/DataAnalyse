@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
@@ -16,6 +18,10 @@ from app.services.table_file_converter import convert_table_file_to_xlsx
 from app.services.table_object_storage import TableObjectStorage
 from app.services.table_qa import TableQAService
 from app.services.table_search_index import TableSearchIndex, build_table_summary
+
+
+MAX_PARALLEL_SUB_QUERIES = 4
+MAX_REWRITTEN_QUERIES = 8
 
 
 class TablePipelineService:
@@ -78,6 +84,7 @@ class TablePipelineService:
             normalized_headers=parse_result.normalized_headers,
             hierarchy_definition=parse_result.hierarchy_definition,
             summary_text=parse_result.summary_text,
+            tree=tree_with_name,
         )
         index_document = {
             "table_id": table_id,
@@ -122,19 +129,135 @@ class TablePipelineService:
         evidence_limit: int = 12,
         use_llm: bool = True,
     ) -> dict[str, Any]:
-        candidates = self.index.search(question, top_k=top_k)
+        qa_service = TableQAService(self.settings)
+        llm = qa_service.llm if use_llm else None
+        query_plan = _build_query_plan(question, llm)
+        retrieval_questions = query_plan["sub_questions"]
+        query_results = self._answer_retrieval_questions(
+            retrieval_questions=retrieval_questions,
+            top_k=top_k,
+            evidence_limit=evidence_limit,
+            use_llm=use_llm,
+            qa_service=qa_service if len(retrieval_questions) == 1 else None,
+        )
+        table_candidates = _dedupe_query_candidates(query_results)
+        table_answers = [
+            item
+            for result in query_results
+            for item in result.get("table_answers", [])
+        ]
+
+        if not table_candidates:
+            return _json_safe(
+                {
+                    "answer": "当前未检索到相关表格，无法回答问题。",
+                    "mode": "pipeline_no_table_candidates",
+                    "original_question": question,
+                    "retrieval_question": (
+                        retrieval_questions[0]
+                        if len(retrieval_questions) == 1
+                        else question
+                    ),
+                    "retrieval_questions": retrieval_questions,
+                    "query_plan": query_plan,
+                    "query_results": _trim_query_results(query_results),
+                    "table_candidates": [],
+                    "table_answers": [],
+                }
+            )
+
+        answer = _synthesize_pipeline_answer(
+            question=question,
+            table_answers=table_answers,
+            llm=llm,
+        )
+        return _json_safe(
+            {
+                "answer": answer,
+                "mode": "es_minio_tree_qa",
+                "original_question": question,
+                "retrieval_question": (
+                    retrieval_questions[0]
+                    if len(retrieval_questions) == 1
+                    else question
+                ),
+                "retrieval_questions": retrieval_questions,
+                "query_plan": query_plan,
+                "query_results": _trim_query_results(query_results),
+                "table_candidates": _trim_candidate_payload(table_candidates),
+                "table_answers": table_answers,
+            }
+        )
+
+    def _answer_retrieval_questions(
+        self,
+        retrieval_questions: list[str],
+        top_k: int,
+        evidence_limit: int,
+        use_llm: bool,
+        qa_service: TableQAService | None = None,
+    ) -> list[dict[str, Any]]:
+        if len(retrieval_questions) <= 1:
+            return [
+                self._answer_single_retrieval_question(
+                    retrieval_question=retrieval_questions[0],
+                    top_k=top_k,
+                    evidence_limit=evidence_limit,
+                    use_llm=use_llm,
+                    qa_service=qa_service,
+                )
+            ]
+
+        results: list[dict[str, Any] | None] = [None] * len(retrieval_questions)
+        worker_count = min(len(retrieval_questions), MAX_PARALLEL_SUB_QUERIES)
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_index = {
+                executor.submit(
+                    self._answer_single_retrieval_question,
+                    retrieval_question=retrieval_question,
+                    top_k=top_k,
+                    evidence_limit=evidence_limit,
+                    use_llm=use_llm,
+                ): index
+                for index, retrieval_question in enumerate(retrieval_questions)
+            }
+            for future in as_completed(future_to_index):
+                results[future_to_index[future]] = future.result()
+        return [result for result in results if result is not None]
+
+    def _answer_single_retrieval_question(
+        self,
+        retrieval_question: str,
+        top_k: int,
+        evidence_limit: int,
+        use_llm: bool,
+        qa_service: TableQAService | None = None,
+    ) -> dict[str, Any]:
+        candidates = self.index.search(retrieval_question, top_k=top_k)
         if not candidates:
             return {
-                "answer": "当前未检索到相关表格，无法回答问题。",
-                "mode": "pipeline_no_table_candidates",
+                "question": retrieval_question,
                 "table_candidates": [],
-                "table_answers": [],
+                "table_answers": [
+                    {
+                        "sub_question": retrieval_question,
+                        "retrieval_question": retrieval_question,
+                        "table": None,
+                        "error": "当前未检索到相关表格",
+                    }
+                ],
             }
 
-        qa_service = TableQAService(self.settings)
+        service = qa_service or TableQAService(self.settings)
         table_answers: list[dict[str, Any]] = []
-
         for candidate in candidates:
+            table_payload = {
+                "table_id": candidate.get("table_id"),
+                "filename": candidate.get("filename"),
+                "sheet_name": candidate.get("sheet_name"),
+                "table_title": candidate.get("table_title"),
+                "score": candidate.get("score"),
+            }
             try:
                 artifact = self.storage.get_json(candidate["tree_object"])
                 metadata = {
@@ -143,8 +266,8 @@ class TablePipelineService:
                     "sheet_name": artifact.get("sheet_name"),
                     "table_title": artifact.get("table_title"),
                 }
-                qa_result = qa_service.answer(
-                    question=question,
+                qa_result = service.answer(
+                    question=retrieval_question,
                     tree=artifact.get("tree") or {},
                     metadata=metadata,
                     limit=evidence_limit,
@@ -152,43 +275,27 @@ class TablePipelineService:
                 )
                 table_answers.append(
                     {
-                        "table": {
-                            "table_id": candidate.get("table_id"),
-                            "filename": candidate.get("filename"),
-                            "sheet_name": candidate.get("sheet_name"),
-                            "table_title": candidate.get("table_title"),
-                            "score": candidate.get("score"),
-                        },
+                        "sub_question": retrieval_question,
+                        "retrieval_question": retrieval_question,
+                        "table": table_payload,
                         "qa": qa_result,
                     }
                 )
             except Exception as exc:
                 table_answers.append(
                     {
-                        "table": {
-                            "table_id": candidate.get("table_id"),
-                            "filename": candidate.get("filename"),
-                            "sheet_name": candidate.get("sheet_name"),
-                            "table_title": candidate.get("table_title"),
-                            "score": candidate.get("score"),
-                        },
+                        "sub_question": retrieval_question,
+                        "retrieval_question": retrieval_question,
+                        "table": table_payload,
                         "error": f"{exc.__class__.__name__}: {exc}",
                     }
                 )
 
-        answer = _synthesize_pipeline_answer(
-            question=question,
-            table_answers=table_answers,
-            llm=qa_service.llm if use_llm else None,
-        )
-        return _json_safe(
-            {
-                "answer": answer,
-                "mode": "es_minio_tree_qa",
-                "table_candidates": _trim_candidate_payload(candidates),
-                "table_answers": table_answers,
-            }
-        )
+        return {
+            "question": retrieval_question,
+            "table_candidates": candidates,
+            "table_answers": table_answers,
+        }
 
     def get_table_artifact(self, table_id: str) -> dict[str, Any]:
         return self.storage.get_json(self.storage.tree_object_name(table_id))
@@ -207,6 +314,7 @@ class TablePipelineService:
                 "minio_objects": artifact.get("minio_objects"),
                 "summary_text": (document or {}).get("summary_text"),
                 "candidate_fields": (document or {}).get("candidate_fields", []),
+                "tree_metric_names": (document or {}).get("tree_metric_names", []),
                 "indexed": document is not None,
             }
         )
@@ -224,6 +332,7 @@ class TablePipelineService:
                     "table_title": document.get("table_title"),
                     "summary_text": document.get("summary_text"),
                     "candidate_fields": document.get("candidate_fields", []),
+                    "tree_metric_names": document.get("tree_metric_names", []),
                     "created_at": document.get("created_at"),
                     "indexed": True,
                     "minio_objects": {
@@ -283,26 +392,259 @@ class TablePipelineService:
         return str(filename), media_type, self.storage.get_bytes(str(object_name))
 
 
+def _build_query_plan(question: str, llm: Any | None) -> dict[str, Any]:
+    normalized_question = question.strip()
+    if not normalized_question:
+        return {
+            "original_question": question,
+            "sub_questions": [question],
+            "rewritten": False,
+            "source": "original",
+        }
+
+    if llm is not None:
+        try:
+            sub_questions = _rewrite_queries_with_llm(normalized_question, llm)
+            if sub_questions:
+                return {
+                    "original_question": normalized_question,
+                    "sub_questions": sub_questions,
+                    "rewritten": sub_questions != [normalized_question],
+                    "source": "llm",
+                }
+        except Exception as exc:
+            fallback = _split_question_heuristically(normalized_question)
+            return {
+                "original_question": normalized_question,
+                "sub_questions": fallback,
+                "rewritten": fallback != [normalized_question],
+                "source": "heuristic_after_llm_error",
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
+
+    sub_questions = _split_question_heuristically(normalized_question)
+    return {
+        "original_question": normalized_question,
+        "sub_questions": sub_questions,
+        "rewritten": sub_questions != [normalized_question],
+        "source": "heuristic" if sub_questions != [normalized_question] else "original",
+    }
+
+
+def _rewrite_queries_with_llm(question: str, llm: Any) -> list[str]:
+    prompt = f"""
+你是一个表格问答 query 改写助手。请把用户 query 改写成适合独立检索的子问题。
+
+规则：
+1. 如果 query 同时询问多个并列对象、指标或统计项，请拆成多个完整子问题。
+2. 每个子问题必须保留共同限定条件，例如学校、院系、年份、范围、单位、统计口径。
+3. 每个子问题必须能单独作为检索 query 使用，不要输出只有名词的片段。
+4. 如果 query 只有一个明确问题，请原样返回一个子问题。
+5. 不要回答问题，只输出 JSON 对象。
+6. sub_questions 最多 {MAX_REWRITTEN_QUERIES} 个。
+
+示例：
+用户 query：湖南师范大学的博士研究生，普通本科生，硕士研究生有多少
+输出：{{"sub_questions":["湖南师范大学的博士研究生有多少","湖南师范大学的普通本科生有多少","湖南师范大学的硕士研究生有多少"]}}
+
+输出格式：
+{{"sub_questions":["完整子问题1","完整子问题2"]}}
+
+用户 query：
+{question}
+"""
+    response = llm.invoke([HumanMessage(content=prompt)])
+    content = str(getattr(response, "content", response)).strip()
+    payload = json.loads(_extract_json_object(content))
+    values = payload.get("sub_questions", [])
+    return _normalize_rewritten_queries(question, values)
+
+
+def _split_question_heuristically(question: str) -> list[str]:
+    stripped = question.strip()
+    body = stripped.rstrip("？?")
+    suffix = _detect_question_suffix(body)
+    if not suffix:
+        return [stripped]
+
+    stem = body[: -len(suffix["matched"])].strip()
+    parts = _split_parallel_parts(stem)
+    if len(parts) < 2:
+        return [stripped]
+
+    prefix, first_item = _split_shared_prefix(parts[0])
+    if not prefix or not first_item:
+        return [stripped]
+
+    rewritten: list[str] = []
+    for index, part in enumerate(parts):
+        item = first_item if index == 0 else part
+        if not item:
+            continue
+        if "的" not in item and not item.startswith(prefix):
+            item = f"{prefix}{item}"
+        rewritten.append(f"{item}{suffix['normalized']}")
+    return _normalize_rewritten_queries(stripped, rewritten) or [stripped]
+
+
+def _detect_question_suffix(question: str) -> dict[str, str] | None:
+    suffixes = [
+        ("数量分别是多少", "数量是多少"),
+        ("人数分别是多少", "人数是多少"),
+        ("分别有多少", "有多少"),
+        ("分别是多少", "是多少"),
+        ("总数是多少", "总数是多少"),
+        ("数量是多少", "数量是多少"),
+        ("人数是多少", "人数是多少"),
+        ("有多少", "有多少"),
+        ("是多少", "是多少"),
+        ("有哪些", "有哪些"),
+        ("是什么", "是什么"),
+    ]
+    for matched, normalized in suffixes:
+        if question.endswith(matched):
+            return {"matched": matched, "normalized": normalized}
+    return None
+
+
+def _split_parallel_parts(text: str) -> list[str]:
+    raw_parts = [
+        part.strip()
+        for part in re.split(r"[，,、；;]+", text)
+        if part.strip()
+    ]
+    if len(raw_parts) < 2:
+        return raw_parts
+
+    parts: list[str] = []
+    for part in raw_parts:
+        sub_parts = [
+            item.strip()
+            for item in re.split(r"(?<!的)[和及与](?!的)", part)
+            if item.strip()
+        ]
+        if len(sub_parts) > 1 and all("的" not in item for item in sub_parts):
+            parts.extend(sub_parts)
+        else:
+            parts.append(part)
+    return parts
+
+
+def _split_shared_prefix(first_part: str) -> tuple[str, str]:
+    separator_index = first_part.rfind("的")
+    if separator_index < 0:
+        return "", first_part
+    prefix = first_part[: separator_index + 1].strip()
+    item = first_part[separator_index + 1 :].strip()
+    return prefix, item
+
+
+def _normalize_rewritten_queries(question: str, values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+
+    seen: set[str] = set()
+    result: list[str] = []
+    original_key = re.sub(r"\s+", "", question.lower())
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        text = re.sub(r"^[\d一二三四五六七八九十]+[.、)\）]\s*", "", text)
+        if not text:
+            continue
+        key = re.sub(r"\s+", "", text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= MAX_REWRITTEN_QUERIES:
+            break
+    if len(result) > 1:
+        result = [
+            text
+            for text in result
+            if re.sub(r"\s+", "", text.lower()) != original_key
+        ] or result
+    return result or [question]
+
+
+def _dedupe_query_candidates(query_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    for query_result in query_results:
+        question = query_result.get("question")
+        for index, candidate in enumerate(query_result.get("table_candidates", [])):
+            key = str(
+                candidate.get("table_id")
+                or candidate.get("tree_object")
+                or f"{question}:{index}"
+            )
+            if key not in by_key:
+                by_key[key] = {
+                    **candidate,
+                    "matched_queries": [question] if question else [],
+                }
+                order.append(key)
+                continue
+
+            existing = by_key[key]
+            if _candidate_score(candidate) > _candidate_score(existing):
+                existing.update(candidate)
+            matched_queries = existing.setdefault("matched_queries", [])
+            if question and question not in matched_queries:
+                matched_queries.append(question)
+
+    return [by_key[key] for key in order]
+
+
+def _candidate_score(candidate: dict[str, Any]) -> float:
+    score = candidate.get("score")
+    return float(score) if isinstance(score, (int, float)) else float("-inf")
+
+
+def _trim_query_results(query_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trimmed: list[dict[str, Any]] = []
+    for item in query_results:
+        table_answers = item.get("table_answers", [])
+        trimmed.append(
+            {
+                "question": item.get("question"),
+                "table_candidates": _trim_candidate_payload(
+                    item.get("table_candidates", [])
+                ),
+                "table_answer_count": len(table_answers),
+                "answerable_count": len(_compact_answerable_table_answers(table_answers)),
+            }
+        )
+    return trimmed
+
+
 def _synthesize_pipeline_answer(
     question: str,
     table_answers: list[dict[str, Any]],
     llm: Any | None,
 ) -> str:
-    compact_answers = [
-        {
-            "table": item.get("table"),
-            "answer": item.get("qa", {}).get("answer"),
-            "evidence_paths": item.get("qa", {}).get("evidence_paths", []),
-            "error": item.get("error"),
-        }
-        for item in table_answers
-    ]
+    compact_answers = _compact_answerable_table_answers(table_answers)
+    compact_answers.extend(_compact_unanswered_sub_questions(table_answers, compact_answers))
+    if not compact_answers:
+        compact_answers = [
+            {
+                "table": item.get("table"),
+                "sub_question": item.get("sub_question"),
+                "answer": item.get("qa", {}).get("answer"),
+                "evidence_paths": item.get("qa", {}).get("evidence_paths", []),
+                "error": item.get("error"),
+            }
+            for item in table_answers
+        ]
     if llm is None:
         lines = ["检索到的表格问答结果："]
         for item in compact_answers:
             table = item.get("table") or {}
             title = table.get("table_title") or table.get("filename") or table.get("table_id")
-            lines.append(f"- {title}: {item.get('answer') or item.get('error')}")
+            sub_question = item.get("sub_question")
+            prefix = f"{sub_question} - " if sub_question else ""
+            lines.append(f"- {prefix}{title}: {item.get('answer') or item.get('error')}")
         return "\n".join(lines)
 
     prompt = f"""
@@ -313,6 +655,7 @@ def _synthesize_pipeline_answer(
 2. 如果证据足够，直接回答，并说明来自哪些表格。
 3. 如果多个表格给出互补证据，请合并回答。
 4. 如果候选表格都没有足够证据，请说明“当前证据不足”。
+5. 如果 table_answers 中包含 sub_question，请逐个覆盖这些子问题，再汇总回答原始问题。
 
 用户问题：
 {question}
@@ -322,6 +665,70 @@ table_answers:
 """
     response = llm.invoke([HumanMessage(content=prompt)])
     return str(getattr(response, "content", response)).strip()
+
+
+def _compact_answerable_table_answers(table_answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in table_answers:
+        qa = item.get("qa") or {}
+        evidence_paths = qa.get("evidence_paths", [])
+        answer = str(qa.get("answer") or "")
+        if not evidence_paths:
+            continue
+        if "当前证据不足" in answer:
+            continue
+        compact.append(
+            {
+                "table": item.get("table"),
+                "sub_question": item.get("sub_question"),
+                "answer": answer,
+                "evidence_paths": evidence_paths,
+                "error": item.get("error"),
+            }
+        )
+    return compact
+
+
+def _compact_unanswered_sub_questions(
+    table_answers: list[dict[str, Any]],
+    compact_answers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    all_sub_questions = _dedupe_strings(
+        [
+            str(item.get("sub_question") or "")
+            for item in table_answers
+            if item.get("sub_question")
+        ]
+    )
+    if len(all_sub_questions) <= 1:
+        return []
+
+    answered = {
+        str(item.get("sub_question") or "")
+        for item in compact_answers
+        if item.get("sub_question")
+    }
+    unanswered: list[dict[str, Any]] = []
+    for sub_question in all_sub_questions:
+        if sub_question in answered:
+            continue
+        related = [
+            item
+            for item in table_answers
+            if item.get("sub_question") == sub_question
+        ]
+        first = related[0] if related else {}
+        qa = first.get("qa") or {}
+        unanswered.append(
+            {
+                "table": first.get("table"),
+                "sub_question": sub_question,
+                "answer": qa.get("answer") or first.get("error") or "当前证据不足",
+                "evidence_paths": qa.get("evidence_paths", []),
+                "error": first.get("error"),
+            }
+        )
+    return unanswered
 
 
 def _trim_candidate_payload(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -335,8 +742,34 @@ def _trim_candidate_payload(candidates: list[dict[str, Any]]) -> list[dict[str, 
                 "sheet_name": candidate.get("sheet_name"),
                 "table_title": candidate.get("table_title"),
                 "tree_object": candidate.get("tree_object"),
+                "tree_metric_names": candidate.get("tree_metric_names", [])[:80],
+                "matched_queries": candidate.get("matched_queries", []),
             }
         )
+    return result
+
+
+def _extract_json_object(text: str) -> str:
+    if "```json" in text:
+        return text.split("```json", 1)[1].split("```", 1)[0].strip()
+    if "```" in text:
+        return text.split("```", 1)[1].split("```", 1)[0].strip()
+    start = text.find("{")
+    end = text.rfind("}") + 1
+    if start < 0 or end <= start:
+        raise ValueError("No JSON object found")
+    return text[start:end]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = re.sub(r"\s+", "", value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(value)
     return result
 
 

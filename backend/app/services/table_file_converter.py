@@ -45,7 +45,7 @@ def convert_table_file_to_xlsx(filename: str, content: bytes) -> ConvertedTableF
         source_extension=extension,
     )
 
-
+# 检查是否是无用的xlsx文件，例如强行更改拓展名的文件
 def _validate_xlsx(content: bytes) -> bytes:
     try:
         load_workbook(io.BytesIO(content), read_only=True)

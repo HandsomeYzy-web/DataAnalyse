@@ -17,19 +17,20 @@ if celery_app is not None:
         filename: str,
         source_object: str,
         sheet_name: str | None = None,
+        batch_id: str | None = None,
     ) -> dict[str, Any]:
         settings = get_settings()
         storage = TableObjectStorage(settings)
 
         self.update_state(
             state="PROGRESS",
-            meta=_task_meta(table_id, filename, sheet_name, "loading_source"),
+            meta=_task_meta(table_id, batch_id, filename, sheet_name, "loading_source"),
         )
         source_content = storage.get_bytes(source_object)
 
         self.update_state(
             state="PROGRESS",
-            meta=_task_meta(table_id, filename, sheet_name, "parsing_and_indexing"),
+            meta=_task_meta(table_id, batch_id, filename, sheet_name, "parsing_and_indexing"),
         )
         service = TablePipelineService(settings)
         result = service.ingest_table(
@@ -37,18 +38,22 @@ if celery_app is not None:
             content=source_content,
             sheet_name=sheet_name,
             table_id=table_id,
+            batch_id=batch_id,
+            source_object=source_object,
         )
         return _compact_ingest_result(result)
 
 
 def _task_meta(
     table_id: str,
+    batch_id: str | None,
     filename: str,
     sheet_name: str | None,
     step: str,
 ) -> dict[str, Any]:
     return {
         "table_id": table_id,
+        "batch_id": batch_id,
         "filename": filename,
         "sheet_name": sheet_name,
         "step": step,

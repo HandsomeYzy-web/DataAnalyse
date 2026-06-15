@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from app.core.settings import Settings
 from app.services.table2tree_enhanced import LangChainEnhancedTableParser
@@ -36,6 +36,8 @@ class TablePipelineService:
         content: bytes,
         sheet_name: str | None = None,
         table_id: str | None = None,
+        batch_id: str | None = None,
+        source_object: str | None = None,
     ) -> dict[str, Any]:
         converted = convert_table_file_to_xlsx(filename, content)
         workbook = load_workbook(io.BytesIO(converted.xlsx_content), data_only=True)
@@ -49,15 +51,19 @@ class TablePipelineService:
         parser = LangChainEnhancedTableParser(self.settings)
         parse_result = parser.parse_sheet(sheet)
         table_id = table_id or uuid4().hex
+        batch_id = batch_id or table_id
         table_name = _table_display_name(parse_result.table_title, sheet.title, converted.original_filename)
         tree_with_name = _attach_table_name(parse_result.tree, table_name)
         tree_refs_with_name = _attach_table_name(parse_result.tree_with_cell_refs, table_name)
+        sheet_normalized_filename = f"{_safe_sheet_filename(sheet.title)}.xlsx"
+        sheet_xlsx_content = _workbook_sheet_to_xlsx(workbook, sheet.title)
 
         artifact = _json_safe(
             {
                 "table_id": table_id,
+                "batch_id": batch_id,
                 "filename": converted.original_filename,
-                "normalized_filename": converted.normalized_filename,
+                "normalized_filename": sheet_normalized_filename,
                 "source_extension": converted.source_extension,
                 "sheet_name": sheet.title,
                 "table_title": parse_result.table_title,
@@ -73,10 +79,12 @@ class TablePipelineService:
 
         stored = self.storage.store_table_artifacts(
             table_id=table_id,
+            batch_id=batch_id,
             source_filename=converted.original_filename,
-            source_content=converted.source_content,
-            normalized_filename=converted.normalized_filename,
-            xlsx_content=converted.xlsx_content,
+            source_content=None if source_object else converted.source_content,
+            source_object=source_object,
+            normalized_filename=sheet_normalized_filename,
+            xlsx_content=sheet_xlsx_content,
             artifact=artifact,
         )
 
@@ -88,8 +96,9 @@ class TablePipelineService:
         )
         index_document = {
             "table_id": table_id,
+            "batch_id": batch_id,
             "filename": converted.original_filename,
-            "normalized_filename": converted.normalized_filename,
+            "normalized_filename": sheet_normalized_filename,
             "source_extension": converted.source_extension,
             "sheet_name": sheet.title,
             "table_title": parse_result.table_title,
@@ -105,8 +114,9 @@ class TablePipelineService:
         return _json_safe(
             {
                 "table_id": table_id,
+                "batch_id": batch_id,
                 "filename": converted.original_filename,
-                "normalized_filename": converted.normalized_filename,
+                "normalized_filename": sheet_normalized_filename,
                 "sheet_name": sheet.title,
                 "table_title": parse_result.table_title,
                 "summary_text": summary["summary_text"],
@@ -253,6 +263,7 @@ class TablePipelineService:
         for candidate in candidates:
             table_payload = {
                 "table_id": candidate.get("table_id"),
+                "batch_id": candidate.get("batch_id"),
                 "filename": candidate.get("filename"),
                 "sheet_name": candidate.get("sheet_name"),
                 "table_title": candidate.get("table_title"),
@@ -298,7 +309,9 @@ class TablePipelineService:
         }
 
     def get_table_artifact(self, table_id: str) -> dict[str, Any]:
-        return self.storage.get_json(self.storage.tree_object_name(table_id))
+        document = self.index.get_table_document(table_id)
+        tree_object = document.get("tree_object") if document else None
+        return self.storage.get_json(str(tree_object or self.storage.tree_object_name(table_id)))
 
     def get_table_summary(self, table_id: str) -> dict[str, Any]:
         artifact = self.get_table_artifact(table_id)
@@ -306,6 +319,7 @@ class TablePipelineService:
         return _json_safe(
             {
                 "table_id": table_id,
+                "batch_id": artifact.get("batch_id"),
                 "filename": artifact.get("filename"),
                 "normalized_filename": artifact.get("normalized_filename"),
                 "source_extension": artifact.get("source_extension"),
@@ -325,6 +339,7 @@ class TablePipelineService:
             tables.append(
                 {
                     "table_id": document.get("table_id"),
+                    "batch_id": document.get("batch_id"),
                     "filename": document.get("filename"),
                     "normalized_filename": document.get("normalized_filename"),
                     "source_extension": document.get("source_extension"),
@@ -354,6 +369,7 @@ class TablePipelineService:
         return _json_safe(
             {
                 "table_id": table_id,
+                "batch_id": artifact.get("batch_id"),
                 "filename": artifact.get("filename"),
                 "sheet_name": artifact.get("sheet_name"),
                 "table_title": artifact.get("table_title"),
@@ -738,6 +754,7 @@ def _trim_candidate_payload(candidates: list[dict[str, Any]]) -> list[dict[str, 
             {
                 "score": candidate.get("score"),
                 "table_id": candidate.get("table_id"),
+                "batch_id": candidate.get("batch_id"),
                 "filename": candidate.get("filename"),
                 "sheet_name": candidate.get("sheet_name"),
                 "table_title": candidate.get("table_title"),
@@ -800,6 +817,31 @@ def _attach_table_name(tree: Any, table_name: str) -> dict[str, Any]:
         "表格名": table_name,
         "数据": tree,
     }
+
+
+def _workbook_sheet_to_xlsx(workbook: Workbook, sheet_name: str) -> bytes:
+    source_sheet = workbook[sheet_name]
+    output_workbook = Workbook()
+    output_sheet = output_workbook.active
+    output_sheet.title = _safe_excel_sheet_title(sheet_name)
+
+    for row in source_sheet.iter_rows():
+        for cell in row:
+            output_sheet[cell.coordinate].value = cell.value
+
+    output = io.BytesIO()
+    output_workbook.save(output)
+    return output.getvalue()
+
+
+def _safe_excel_sheet_title(sheet_name: str) -> str:
+    title = re.sub(r"[\[\]:*?/\\]", "_", str(sheet_name).strip()) or "Sheet1"
+    return title[:31]
+
+
+def _safe_sheet_filename(sheet_name: str) -> str:
+    cleaned = re.sub(r"[^\w.\-()\u4e00-\u9fff]+", "_", str(sheet_name).strip())
+    return cleaned or "Sheet1"
 
 
 def _json_safe(value: Any) -> Any:

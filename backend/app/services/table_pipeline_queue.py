@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import io
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from openpyxl import load_workbook
+
 from app.core.settings import Settings
+from app.services.table_file_converter import convert_table_file_to_xlsx
 from app.services.table_object_storage import TableObjectStorage
 
 
@@ -18,33 +22,74 @@ class TablePipelineQueue:
         content: bytes,
         sheet_name: str | None = None,
     ) -> dict[str, Any]:
+        batch = self.submit_batch(filename=filename, content=content, sheet_name=sheet_name)
+        return batch["jobs"][0]
+
+    def submit_batch(
+        self,
+        filename: str,
+        content: bytes,
+        sheet_name: str | None = None,
+    ) -> dict[str, Any]:
         celery_app = _require_celery_app()
-        table_id = uuid4().hex
+        batch_id = uuid4().hex
+        converted = convert_table_file_to_xlsx(filename, content)
+        workbook = load_workbook(io.BytesIO(converted.xlsx_content), read_only=True)
+        if sheet_name:
+            if sheet_name not in workbook.sheetnames:
+                raise ValueError(f"Sheet not found: {sheet_name}")
+            sheet_names = [sheet_name]
+        else:
+            sheet_names = list(workbook.sheetnames)
+        workbook.close()
+
         storage = TableObjectStorage(self.settings)
-        source_object = storage.store_source_file(table_id, filename, content)
-        task = celery_app.send_task(
-            "table_pipeline.ingest",
-            kwargs={
-                "table_id": table_id,
-                "filename": filename,
-                "source_object": source_object,
-                "sheet_name": sheet_name,
-            },
-            task_id=table_id,
+        source_object = storage.store_source_file(
+            batch_id,
+            converted.original_filename,
+            converted.source_content,
         )
+        jobs = []
+        for current_sheet_name in sheet_names:
+            table_id = uuid4().hex
+            task = celery_app.send_task(
+                "table_pipeline.ingest",
+                kwargs={
+                    "table_id": table_id,
+                    "batch_id": batch_id,
+                    "filename": converted.original_filename,
+                    "source_object": source_object,
+                    "sheet_name": current_sheet_name,
+                },
+                task_id=table_id,
+            )
+            jobs.append(
+                {
+                    "job_id": task.id,
+                    "table_id": table_id,
+                    "batch_id": batch_id,
+                    "filename": converted.original_filename,
+                    "sheet_name": current_sheet_name,
+                    "status": "queued",
+                    "submitted_at": _now(),
+                    "started_at": None,
+                    "finished_at": None,
+                    "error": None,
+                    "result": None,
+                    "queue_size": 0,
+                    "source_object": source_object,
+                }
+            )
         return {
-            "job_id": task.id,
-            "table_id": table_id,
-            "filename": filename,
+            "batch_id": batch_id,
+            "filename": converted.original_filename,
+            "sheet_names": sheet_names,
+            "sheet_count": len(sheet_names),
             "sheet_name": sheet_name,
             "status": "queued",
             "submitted_at": _now(),
-            "started_at": None,
-            "finished_at": None,
-            "error": None,
-            "result": None,
-            "queue_size": 0,
             "source_object": source_object,
+            "jobs": jobs,
         }
 
     def get_job(self, job_id: str) -> dict[str, Any]:
@@ -57,6 +102,11 @@ class TablePipelineQueue:
             info.get("table_id"),
             result.get("table_id") if result else None,
             job_id,
+        )
+        batch_id = _first_present(
+            info.get("batch_id"),
+            result.get("batch_id") if result else None,
+            None,
         )
         filename = _first_present(
             info.get("filename"),
@@ -71,6 +121,7 @@ class TablePipelineQueue:
         return {
             "job_id": job_id,
             "table_id": table_id,
+            "batch_id": batch_id,
             "filename": filename,
             "sheet_name": sheet_name,
             "status": _map_celery_state(state),
@@ -147,6 +198,7 @@ def _inspect_task_to_job(task: dict[str, Any], worker_name: str, status: str) ->
     return {
         "job_id": task_id,
         "table_id": kwargs.get("table_id") or task_id,
+        "batch_id": kwargs.get("batch_id"),
         "filename": kwargs.get("filename") or "",
         "sheet_name": kwargs.get("sheet_name"),
         "status": status,

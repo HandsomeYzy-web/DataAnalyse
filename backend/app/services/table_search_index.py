@@ -78,6 +78,7 @@ class TableSearchIndex:
     def ensure_index(self, vector_dims: int | None = None) -> None:
         properties: dict[str, Any] = {
             "table_id": {"type": "keyword"},
+            "batch_id": {"type": "keyword"},
             "filename": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
             "sheet_name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
             "table_title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},

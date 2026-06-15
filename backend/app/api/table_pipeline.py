@@ -52,7 +52,9 @@ async def upload_table_to_pipeline(
 
     try:
         content = await file.read()
-        return queue.submit(filename=filename, content=content, sheet_name=sheet_name)
+        return queue.submit_batch(filename=filename, content=content, sheet_name=sheet_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
@@ -138,6 +140,9 @@ def get_table_artifact(
         return service.get_table_artifact(table_id)
     except S3Error as exc:
         _raise_minio_http(exc)
+    except ELASTICSEARCH_ERRORS as exc:
+        logger.exception("Pipeline Elasticsearch read failed")
+        raise HTTPException(status_code=502, detail=f"Elasticsearch read failed: {exc}") from exc
 
 
 @router.get("/tables/{table_id}/tree")
@@ -150,6 +155,9 @@ def get_table_tree(
         return service.get_table_tree(table_id)
     except S3Error as exc:
         _raise_minio_http(exc)
+    except ELASTICSEARCH_ERRORS as exc:
+        logger.exception("Pipeline Elasticsearch read failed")
+        raise HTTPException(status_code=502, detail=f"Elasticsearch read failed: {exc}") from exc
 
 
 @router.get("/tables/{table_id}/source")

@@ -33,15 +33,20 @@ class TableObjectStorage:
     def store_table_artifacts(
         self,
         table_id: str,
+        batch_id: str,
         source_filename: str,
-        source_content: bytes,
         normalized_filename: str,
         xlsx_content: bytes,
         artifact: dict[str, Any],
+        source_content: bytes | None = None,
+        source_object: str | None = None,
     ) -> StoredTableArtifacts:
         self.ensure_bucket()
-        prefix = self._table_prefix(table_id)
-        source_object = self.source_object_name(table_id, source_filename)
+        prefix = self._sheet_prefix(batch_id, table_id)
+        if source_object is None:
+            if source_content is None:
+                raise ValueError("source_content is required when source_object is not provided")
+            source_object = self.source_object_name(batch_id, source_filename)
         xlsx_object = f"{prefix}/normalized/{_safe_object_name(normalized_filename)}"
         tree_object = f"{prefix}/tree.json"
         artifact_with_objects = {
@@ -53,7 +58,8 @@ class TableObjectStorage:
             },
         }
 
-        self.put_bytes(source_object, source_content, "application/octet-stream")
+        if source_content is not None:
+            self.put_bytes(source_object, source_content, "application/octet-stream")
         self.put_bytes(
             xlsx_object,
             xlsx_content,
@@ -68,12 +74,12 @@ class TableObjectStorage:
 
     def store_source_file(
         self,
-        table_id: str,
+        batch_id: str,
         source_filename: str,
         source_content: bytes,
     ) -> str:
         self.ensure_bucket()
-        object_name = self.source_object_name(table_id, source_filename)
+        object_name = self.source_object_name(batch_id, source_filename)
         self.put_bytes(object_name, source_content, "application/octet-stream")
         return object_name
 
@@ -118,12 +124,19 @@ class TableObjectStorage:
         return self.client.stat_object(self.bucket, object_name)
 
     def tree_object_name(self, table_id: str) -> str:
-        return f"{self._table_prefix(table_id)}/tree.json"
+        return f"{self._legacy_table_prefix(table_id)}/tree.json"
 
-    def source_object_name(self, table_id: str, source_filename: str) -> str:
-        return f"{self._table_prefix(table_id)}/source/{_safe_object_name(source_filename)}"
+    def source_object_name(self, batch_id: str, source_filename: str) -> str:
+        return f"{self._batch_prefix(batch_id)}/source/{_safe_object_name(source_filename)}"
 
-    def _table_prefix(self, table_id: str) -> str:
+    def _batch_prefix(self, batch_id: str) -> str:
+        prefix = self.settings.table_artifact_prefix.strip().strip("/")
+        return f"{prefix}/{batch_id}" if prefix else batch_id
+
+    def _sheet_prefix(self, batch_id: str, table_id: str) -> str:
+        return f"{self._batch_prefix(batch_id)}/sheets/{table_id}"
+
+    def _legacy_table_prefix(self, table_id: str) -> str:
         prefix = self.settings.table_artifact_prefix.strip().strip("/")
         return f"{prefix}/{table_id}" if prefix else table_id
 

@@ -42,6 +42,7 @@ type IngestResult = {
 type JobStatus = {
   job_id: string;
   table_id: string;
+  batch_id?: string | null;
   filename: string;
   sheet_name?: string | null;
   status: 'queued' | 'running' | 'completed' | 'failed';
@@ -55,6 +56,20 @@ type JobStatus = {
   queue_size: number;
   source_object?: string;
 };
+
+type UploadBatchResponse = {
+  batch_id: string;
+  filename: string;
+  sheet_names: string[];
+  sheet_count: number;
+  sheet_name?: string | null;
+  status: 'queued';
+  submitted_at?: string | null;
+  source_object?: string;
+  jobs: JobStatus[];
+};
+
+type UploadResponse = JobStatus | UploadBatchResponse;
 
 type UploadRecord = JobStatus & {
   file?: File;
@@ -318,17 +333,21 @@ async function submitFile(file: File, sheet?: string, isRetry = false, controlle
   detailError.value = '';
 
   try {
-    const payload = await requestJson<JobStatus>(`/api/table-pipeline/upload${query}`, {
+    const payload = await requestJson<UploadResponse>(`/api/table-pipeline/upload${query}`, {
       method: 'POST',
       body: formData,
     });
-    upsertUploadRecord({ ...payload, file });
-    selectedJobId.value = payload.job_id;
+    const jobs = normalizeUploadJobs(payload);
+    for (const job of jobs) {
+      upsertUploadRecord({ ...job, file });
+      startPolling(job.job_id);
+    }
+    const firstJob = jobs[0];
+    selectedJobId.value = firstJob?.job_id || '';
     selectedTableId.value = '';
     if (isRetry) {
       selectedFiles.value = [file];
     }
-    startPolling(payload.job_id);
     return true;
   } catch (err) {
     const message = errorMessage(err, '提交解析任务失败');
@@ -475,6 +494,13 @@ function upsertUploadRecord(record: UploadRecord) {
     return;
   }
   uploadRecords.value.unshift(record);
+}
+
+function normalizeUploadJobs(payload: UploadResponse): JobStatus[] {
+  if ('jobs' in payload) {
+    return payload.jobs || [];
+  }
+  return [payload];
 }
 
 function createFailedUploadRecord(file: File, sheet: string | undefined, error: string): UploadRecord {
@@ -700,7 +726,7 @@ function errorMessage(err: unknown, fallback: string) {
               <component :is="statusIcon(record.status)" :size="18" />
               <span class="job-main">
                 <strong>{{ record.filename || record.table_id }}</strong>
-                <small>{{ statusLabel(record.status) }} · {{ record.step || record.celery_state || 'pipeline' }}</small>
+                <small>{{ record.sheet_name || '-' }} · {{ statusLabel(record.status) }} · {{ record.step || record.celery_state || 'pipeline' }}</small>
               </span>
               <RotateCcw
                 v-if="record.status === 'failed'"

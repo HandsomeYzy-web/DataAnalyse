@@ -10,6 +10,11 @@ class Settings(BaseSettings):
     llm_model: str = ""
     llm_temperature: float = 0.2
     llm_timeout_seconds: int = 300
+    large_table_cell_threshold: int = 800
+    large_table_row_threshold: int = 80
+    large_table_column_threshold: int = 30
+    large_table_merged_cell_threshold: int = 20
+    large_table_markdown_threshold: int = 30000
     embedding_base_url: str = ""
     embedding_api_key: str = ""
     embedding_model: str = ""

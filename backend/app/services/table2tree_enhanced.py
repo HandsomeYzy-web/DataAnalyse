@@ -178,9 +178,21 @@ def parse_json_with_merge(llm_output: str) -> dict[str, Any]:
 
     try:
         parsed = json.loads(json_content, object_pairs_hook=recursive_merge_hook)
-    except JSONDecodeError:
+    except JSONDecodeError as first_exc:
         repaired_json = _repair_common_json_issues(json_content)
-        parsed = json.loads(repaired_json, object_pairs_hook=recursive_merge_hook)
+        try:
+            parsed = json.loads(repaired_json, object_pairs_hook=recursive_merge_hook)
+        except JSONDecodeError:
+            print(
+                "\n[LLM_FINAL_TREE_JSON_PARSE_FAILED]\n"
+                f"first_error={first_exc}\n"
+                f"raw_output:\n{llm_output}\n"
+                f"extracted_json:\n{json_content}\n"
+                f"repaired_json:\n{repaired_json}\n"
+                "[/LLM_FINAL_TREE_JSON_PARSE_FAILED]\n",
+                flush=True,
+            )
+            raise
     if not isinstance(parsed, dict):
         raise ValueError("LLM final tree output must be a JSON object")
     return parsed

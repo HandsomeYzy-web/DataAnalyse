@@ -25,6 +25,9 @@ type IngestResult = {
   normalized_filename: string;
   sheet_name: string;
   table_title?: string;
+  parse_mode?: string;
+  large_table_reason?: string | null;
+  coverage?: Record<string, unknown> | null;
   summary_text: string;
   candidate_fields: string[];
   minio_objects: MinioObjects;
@@ -88,6 +91,9 @@ type TableSummary = {
   source_extension?: string;
   sheet_name?: string;
   table_title?: string;
+  parse_mode?: string;
+  large_table_reason?: string | null;
+  coverage?: Record<string, unknown> | null;
   summary_text?: string;
   candidate_fields?: string[];
   created_at?: string;
@@ -534,6 +540,9 @@ function resultToSummary(result: IngestResult | TableSummary | null): TableSumma
     source_extension: 'source_extension' in result ? result.source_extension : undefined,
     sheet_name: result.sheet_name,
     table_title: result.table_title,
+    parse_mode: result.parse_mode,
+    large_table_reason: result.large_table_reason,
+    coverage: result.coverage,
     summary_text: result.summary_text,
     candidate_fields: result.candidate_fields,
     indexed: result.indexed,
@@ -804,6 +813,14 @@ function errorMessage(err: unknown, fallback: string) {
             <div class="status-row" v-if="selectedSummary?.table_title">
               <span>标题</span>
               <strong>{{ selectedSummary.table_title }}</strong>
+            </div>
+            <div class="status-row" v-if="selectedSummary?.parse_mode">
+              <span>解析模式</span>
+              <strong>{{ selectedSummary.parse_mode }}</strong>
+            </div>
+            <div class="status-row" v-if="selectedSummary?.large_table_reason">
+              <span>大表原因</span>
+              <strong>{{ selectedSummary.large_table_reason }}</strong>
             </div>
             <div class="status-row">
               <span>创建时间</span>

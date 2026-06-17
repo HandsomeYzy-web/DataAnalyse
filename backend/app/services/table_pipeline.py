@@ -4,24 +4,47 @@ import io
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI
 from openpyxl import Workbook, load_workbook
 
 from app.core.settings import Settings
+from app.prompts.table2tree import TABLE_SUMMARY_PROMPT
 from app.services.table2tree_enhanced import LangChainEnhancedTableParser
 from app.services.table_file_converter import convert_table_file_to_xlsx
 from app.services.table_object_storage import TableObjectStorage
+from app.services.table_parse_plan import PlanBasedTableParser
 from app.services.table_qa import TableQAService
 from app.services.table_search_index import TableSearchIndex, build_table_summary
 
 
 MAX_PARALLEL_SUB_QUERIES = 4
 MAX_REWRITTEN_QUERIES = 8
+
+
+@dataclass
+class PipelineParseResult:
+    parse_mode: str
+    large_table_reason: str | None
+    table_title: str
+    markdown_table: str
+    normalized_headers: str
+    hierarchy_definition: str
+    summary_text: str
+    final_json_tree: str | None
+    tree_with_cell_refs: dict[str, Any]
+    tree: dict[str, Any]
+    parse_plan: dict[str, Any] | None = None
+    raw_plan_output: str | None = None
+    validation_warnings: list[str] = field(default_factory=list)
+    coverage: dict[str, Any] | None = None
 
 
 class TablePipelineService:
@@ -48,8 +71,7 @@ class TablePipelineService:
         else:
             sheet = workbook.active
 
-        parser = LangChainEnhancedTableParser(self.settings)
-        parse_result = parser.parse_sheet(sheet)
+        parse_result = self._parse_sheet_for_pipeline(sheet)
         table_id = table_id or uuid4().hex
         batch_id = batch_id or table_id
         table_name = _table_display_name(parse_result.table_title, sheet.title, converted.original_filename)
@@ -67,11 +89,17 @@ class TablePipelineService:
                 "source_extension": converted.source_extension,
                 "sheet_name": sheet.title,
                 "table_title": parse_result.table_title,
+                "parse_mode": parse_result.parse_mode,
+                "large_table_reason": parse_result.large_table_reason,
                 "markdown_table": parse_result.markdown_table,
                 "normalized_headers": parse_result.normalized_headers,
                 "hierarchy_definition": parse_result.hierarchy_definition,
                 "summary_text": parse_result.summary_text,
                 "final_json_tree": parse_result.final_json_tree,
+                "raw_plan_output": parse_result.raw_plan_output,
+                "parse_plan": parse_result.parse_plan,
+                "validation_warnings": parse_result.validation_warnings,
+                "coverage": parse_result.coverage,
                 "tree_with_cell_refs": tree_refs_with_name,
                 "tree": tree_with_name,
             }
@@ -102,6 +130,8 @@ class TablePipelineService:
             "source_extension": converted.source_extension,
             "sheet_name": sheet.title,
             "table_title": parse_result.table_title,
+            "parse_mode": parse_result.parse_mode,
+            "large_table_reason": parse_result.large_table_reason,
             "normalized_headers": parse_result.normalized_headers,
             "hierarchy_definition": parse_result.hierarchy_definition,
             "source_object": stored.source_object,
@@ -119,6 +149,9 @@ class TablePipelineService:
                 "normalized_filename": sheet_normalized_filename,
                 "sheet_name": sheet.title,
                 "table_title": parse_result.table_title,
+                "parse_mode": parse_result.parse_mode,
+                "large_table_reason": parse_result.large_table_reason,
+                "coverage": parse_result.coverage,
                 "summary_text": summary["summary_text"],
                 "candidate_fields": summary["candidate_fields"],
                 "minio_objects": {
@@ -130,6 +163,91 @@ class TablePipelineService:
                 "indexed_vector": bool(indexed_document.get("summary_vector")),
                 "tree": tree_with_name,
             }
+        )
+
+    def _parse_sheet_for_pipeline(self, sheet: Any) -> PipelineParseResult:
+        markdown_table = _sheet_to_markdown_for_size_check(sheet)
+        large_table_reason = _large_table_reason(sheet, markdown_table, self.settings)
+        table_title = _table_display_name(_extract_title_from_sheet(sheet), sheet.title)
+
+        if large_table_reason:
+            return self._parse_sheet_with_plan(
+                sheet=sheet,
+                markdown_table=markdown_table,
+                table_title=table_title,
+                large_table_reason=large_table_reason,
+            )
+
+        enhanced_parser = LangChainEnhancedTableParser(self.settings)
+        enhanced_result = enhanced_parser.parse_sheet(sheet)
+        quality_warnings = _validate_enhanced_tree_quality(enhanced_result.tree_with_cell_refs)
+        if quality_warnings:
+            fallback_reason = "enhanced_tree_quality_failed: " + "; ".join(quality_warnings[:5])
+            print(
+                "\n[ENHANCED_TREE_REJECTED]\n"
+                f"reason={fallback_reason}\n"
+                f"final_json_tree:\n{enhanced_result.final_json_tree}\n"
+                "[/ENHANCED_TREE_REJECTED]\n",
+                flush=True,
+            )
+            return self._parse_sheet_with_plan(
+                sheet=sheet,
+                markdown_table=markdown_table,
+                table_title=table_title,
+                large_table_reason=fallback_reason,
+            )
+        return PipelineParseResult(
+            parse_mode="enhanced_llm",
+            large_table_reason=None,
+            table_title=enhanced_result.table_title,
+            markdown_table=enhanced_result.markdown_table,
+            normalized_headers=enhanced_result.normalized_headers,
+            hierarchy_definition=enhanced_result.hierarchy_definition,
+            summary_text=enhanced_result.summary_text,
+            final_json_tree=enhanced_result.final_json_tree,
+            tree_with_cell_refs=enhanced_result.tree_with_cell_refs,
+            tree=enhanced_result.tree,
+        )
+
+    def _parse_sheet_with_plan(
+        self,
+        sheet: Any,
+        markdown_table: str,
+        table_title: str,
+        large_table_reason: str,
+    ) -> PipelineParseResult:
+        plan_parser = PlanBasedTableParser(self.settings)
+        plan_result = plan_parser.parse_sheet(sheet)
+        parse_plan = plan_result.parse_plan.model_dump()
+        coverage = plan_result.coverage.model_dump()
+        coverage["is_complete"] = plan_result.coverage.is_complete
+        normalized_headers = _plan_normalized_headers(parse_plan)
+        hierarchy_definition = _plan_hierarchy_definition(
+            parse_plan,
+            plan_result.validation_warnings,
+            coverage,
+        )
+        summary_text = _generate_summary_from_llm(
+            settings=self.settings,
+            markdown_table=markdown_table,
+            normalized_headers=normalized_headers,
+            hierarchy_definition=hierarchy_definition,
+        )
+        return PipelineParseResult(
+            parse_mode="plan_based",
+            large_table_reason=large_table_reason,
+            table_title=table_title,
+            markdown_table=markdown_table,
+            normalized_headers=normalized_headers,
+            hierarchy_definition=hierarchy_definition,
+            summary_text=summary_text,
+            final_json_tree=None,
+            tree_with_cell_refs=plan_result.tree_with_cell_refs,
+            tree=plan_result.tree,
+            parse_plan=parse_plan,
+            raw_plan_output=plan_result.raw_plan_output,
+            validation_warnings=plan_result.validation_warnings,
+            coverage=coverage,
         )
 
     def answer_question(
@@ -325,10 +443,14 @@ class TablePipelineService:
                 "source_extension": artifact.get("source_extension"),
                 "sheet_name": artifact.get("sheet_name"),
                 "table_title": artifact.get("table_title"),
+                "parse_mode": artifact.get("parse_mode"),
+                "large_table_reason": artifact.get("large_table_reason"),
+                "coverage": artifact.get("coverage"),
                 "minio_objects": artifact.get("minio_objects"),
                 "summary_text": (document or {}).get("summary_text"),
                 "candidate_fields": (document or {}).get("candidate_fields", []),
                 "tree_metric_names": (document or {}).get("tree_metric_names", []),
+                "embedding_error": (document or {}).get("embedding_error"),
                 "indexed": document is not None,
             }
         )
@@ -345,9 +467,13 @@ class TablePipelineService:
                     "source_extension": document.get("source_extension"),
                     "sheet_name": document.get("sheet_name"),
                     "table_title": document.get("table_title"),
+                    "parse_mode": document.get("parse_mode"),
+                    "large_table_reason": document.get("large_table_reason"),
+                    "coverage": document.get("coverage"),
                     "summary_text": document.get("summary_text"),
                     "candidate_fields": document.get("candidate_fields", []),
                     "tree_metric_names": document.get("tree_metric_names", []),
+                    "embedding_error": document.get("embedding_error"),
                     "created_at": document.get("created_at"),
                     "indexed": True,
                     "minio_objects": {
@@ -795,6 +921,151 @@ def _lookup_object_from_index(index: TableSearchIndex, table_id: str, field_name
     if not document:
         return None
     return document.get(field_name)
+
+
+def _validate_enhanced_tree_quality(tree_with_cell_refs: dict[str, Any]) -> list[str]:
+    warnings: list[str] = []
+    leaf_count = 0
+    bad_leaf_count = 0
+    bad_examples: list[str] = []
+    suspicious_examples: list[str] = []
+    suspicious_patterns = [
+        "极简输出",
+        "仅展示",
+        "完整输出",
+        "如需",
+        "结构示例",
+        "模式已启用",
+        "省略",
+        "未完",
+        "truncated",
+    ]
+
+    def walk(value: Any, path: list[str]) -> None:
+        nonlocal leaf_count, bad_leaf_count
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk(item, [*path, str(key)])
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, [*path, str(index)])
+            return
+
+        leaf_count += 1
+        text = str(value)
+        if any(pattern in text for pattern in suspicious_patterns):
+            if len(suspicious_examples) < 3:
+                suspicious_examples.append(f"{' | '.join(path)}={text[:120]}")
+        if not _is_cell_or_range_ref(text):
+            bad_leaf_count += 1
+            if len(bad_examples) < 3:
+                bad_examples.append(f"{' | '.join(path)}={text[:120]}")
+
+    walk(tree_with_cell_refs, [])
+    if leaf_count == 0:
+        warnings.append("no_leaf_values")
+    if suspicious_examples:
+        warnings.append("model_comment_in_tree: " + " || ".join(suspicious_examples))
+    if bad_leaf_count:
+        warnings.append(
+            f"non_cell_ref_leaf_values={bad_leaf_count}/{leaf_count}: "
+            + " || ".join(bad_examples)
+        )
+    return warnings
+
+
+def _is_cell_or_range_ref(value: str) -> bool:
+    text = value.strip().upper()
+    return bool(
+        re.fullmatch(r"\$?[A-Z]+\$?[0-9]+(:\$?[A-Z]+\$?[0-9]+)?", text)
+    )
+
+
+def _large_table_reason(sheet: Any, markdown_table: str, settings: Settings) -> str | None:
+    reasons: list[str] = []
+    cell_count = int(sheet.max_row or 0) * int(sheet.max_column or 0)
+    merged_cells = getattr(sheet, "merged_cells", None)
+    merged_ranges = getattr(merged_cells, "ranges", []) if merged_cells is not None else []
+    merged_count = len(merged_ranges)
+    if cell_count > settings.large_table_cell_threshold:
+        reasons.append(f"cells={cell_count}>{settings.large_table_cell_threshold}")
+    if int(sheet.max_row or 0) > settings.large_table_row_threshold:
+        reasons.append(f"rows={sheet.max_row}>{settings.large_table_row_threshold}")
+    if int(sheet.max_column or 0) > settings.large_table_column_threshold:
+        reasons.append(f"columns={sheet.max_column}>{settings.large_table_column_threshold}")
+    if merged_count > settings.large_table_merged_cell_threshold:
+        reasons.append(f"merged={merged_count}>{settings.large_table_merged_cell_threshold}")
+    if len(markdown_table) > settings.large_table_markdown_threshold:
+        reasons.append(f"markdown={len(markdown_table)}>{settings.large_table_markdown_threshold}")
+    return "; ".join(reasons) if reasons else None
+
+
+def _sheet_to_markdown_for_size_check(sheet: Any) -> str:
+    from app.services.table2tree_enhanced import excel_to_markdown_with_cell_ref
+
+    return excel_to_markdown_with_cell_ref(sheet)
+
+
+def _extract_title_from_sheet(sheet: Any) -> str:
+    from app.services.table2tree_enhanced import extract_table_title
+
+    return extract_table_title(sheet)
+
+
+def _plan_normalized_headers(parse_plan: dict[str, Any]) -> str:
+    headers = {
+        "hierarchy_columns": parse_plan.get("hierarchy_columns", []),
+        "value_columns": parse_plan.get("value_columns", []),
+    }
+    return json.dumps(headers, ensure_ascii=False)
+
+
+def _plan_hierarchy_definition(
+    parse_plan: dict[str, Any],
+    validation_warnings: list[str],
+    coverage: dict[str, Any],
+) -> str:
+    payload = {
+        "table_range": parse_plan.get("table_range"),
+        "title_ranges": parse_plan.get("title_ranges", []),
+        "header_ranges": parse_plan.get("header_ranges", []),
+        "data_row_range": parse_plan.get("data_row_range"),
+        "hierarchy_columns": parse_plan.get("hierarchy_columns", []),
+        "value_columns": parse_plan.get("value_columns", []),
+        "hierarchy_fill_down": parse_plan.get("hierarchy_fill_down"),
+        "validation_warnings": validation_warnings,
+        "coverage": coverage,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _generate_summary_from_llm(
+    settings: Settings,
+    markdown_table: str,
+    normalized_headers: str,
+    hierarchy_definition: str,
+) -> str:
+    if not settings.llm_model or not settings.llm_api_key:
+        return ""
+    kwargs: dict[str, Any] = {
+        "model": settings.llm_model,
+        "api_key": settings.llm_api_key,
+        "temperature": settings.llm_temperature,
+        "timeout": settings.llm_timeout_seconds,
+    }
+    if settings.llm_base_url:
+        kwargs["base_url"] = settings.llm_base_url
+    llm = ChatOpenAI(**kwargs)
+    prompt = ChatPromptTemplate.from_template(TABLE_SUMMARY_PROMPT)
+    response = (prompt | llm).invoke(
+        {
+            "TABLE_AS_JSON_STRING": markdown_table,
+            "NORMALIZED_HEADERS_FROM_STEP_1": normalized_headers,
+            "HIERARCHY_DEFINITION_FROM_STEP_2": hierarchy_definition,
+        }
+    )
+    return str(getattr(response, "content", response)).strip()
 
 
 def _table_display_name(*values: Any) -> str:

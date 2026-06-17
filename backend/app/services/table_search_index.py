@@ -12,6 +12,9 @@ from openai import OpenAI
 from app.core.settings import Settings
 
 
+MAX_EMBEDDING_TEXT_CHARS = 12000
+
+
 class TableSearchIndex:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -19,6 +22,7 @@ class TableSearchIndex:
         self.client = self._build_client(settings)
         self.embedding_client = self._build_embedding_client(settings)
         self.embedding_model = settings.embedding_model
+        self.last_embedding_error = ""
 
     def index_table(self, document: dict[str, Any]) -> dict[str, Any]:
         vector = self.embed_text(_document_search_text(document))
@@ -27,6 +31,8 @@ class TableSearchIndex:
         indexed_document = dict(document)
         if vector:
             indexed_document["summary_vector"] = vector
+        elif self.last_embedding_error:
+            indexed_document["embedding_error"] = self.last_embedding_error
 
         self.client.index(
             index=self.index_name,
@@ -43,7 +49,9 @@ class TableSearchIndex:
         vector = self.embed_text(question)
         if vector:
             try:
-                return self._vector_search(vector, top_k)
+                results = self._vector_search(vector, top_k)
+                if results:
+                    return results
             except Exception:
                 pass
         return self._text_search(question, top_k)
@@ -82,6 +90,10 @@ class TableSearchIndex:
             "filename": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
             "sheet_name": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
             "table_title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            "parse_mode": {"type": "keyword"},
+            "large_table_reason": {"type": "text"},
+            "coverage": {"type": "object", "enabled": True},
+            "embedding_error": {"type": "text"},
             "summary_text": {"type": "text"},
             "candidate_fields": {"type": "keyword"},
             "normalized_headers": {"type": "text"},
@@ -129,13 +141,27 @@ class TableSearchIndex:
                 )
 
     def embed_text(self, text: str) -> list[float]:
+        self.last_embedding_error = ""
         if not self.embedding_client or not self.embedding_model:
             return []
-        response = self.embedding_client.embeddings.create(
-            model=self.embedding_model,
-            input=[text],
-        )
-        return list(response.data[0].embedding)
+        if not text.strip():
+            return []
+        embedding_text = _truncate_embedding_text(text)
+        try:
+            response = self.embedding_client.embeddings.create(
+                model=self.embedding_model,
+                input=[embedding_text],
+            )
+            if not response.data:
+                raise ValueError("No embedding data received")
+            return list(response.data[0].embedding)
+        except Exception as exc:
+            self.last_embedding_error = f"{exc.__class__.__name__}: {exc}"
+            print(
+                f"[EMBEDDING_FALLBACK_TEXT_ONLY] {self.last_embedding_error}",
+                flush=True,
+            )
+            return []
 
     def _vector_search(self, vector: list[float], top_k: int) -> list[dict[str, Any]]:
         response = self.client.search(
@@ -214,7 +240,6 @@ def build_table_summary(
         [
             *_extract_candidate_fields(normalized_headers),
             *_extract_candidate_fields(hierarchy_definition),
-            *tree_fields["tree_metric_names"],
         ]
     )
     indexed_summary = _append_metrics_to_summary(summary_text, candidate_fields)
@@ -328,15 +353,24 @@ def _document_search_text(document: dict[str, Any]) -> str:
         "filename",
         "sheet_name",
         "summary_text",
-        "tree_search_text",
     ]:
         value = document.get(key)
         if value:
             parts.append(str(value))
     fields = document.get("candidate_fields") or []
-    if fields:
+    if fields and "指标：" not in str(document.get("summary_text") or ""):
         parts.append("指标：" + "、".join(str(item) for item in fields[:120]))
     return "\n".join(parts)
+
+
+def _truncate_embedding_text(text: str) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= MAX_EMBEDDING_TEXT_CHARS:
+        return cleaned
+
+    head_chars = int(MAX_EMBEDDING_TEXT_CHARS * 0.75)
+    tail_chars = MAX_EMBEDDING_TEXT_CHARS - head_chars
+    return f"{cleaned[:head_chars]}\n...\n{cleaned[-tail_chars:]}"
 
 
 def _append_metrics_to_summary(summary_text: str, candidate_fields: list[str]) -> str:
@@ -358,7 +392,49 @@ def _extract_candidate_fields(text: str) -> list[str]:
         _collect_strings(parsed, values)
     if not values:
         values = re.findall(r"[\u4e00-\u9fffA-Za-z0-9_#（）()、\-]{2,}", text)
-    return [value.strip() for value in values if 1 < len(value.strip()) <= 80]
+    return [
+        value.strip()
+        for value in values
+        if _is_candidate_metric_text(value.strip())
+    ]
+
+
+def _is_candidate_metric_text(value: str) -> bool:
+    if not (1 < len(value) <= 80):
+        return False
+    if re.fullmatch(r"[\d.\-]+", value):
+        return False
+    if re.fullmatch(r"\$?[A-Z]+\$?\d+(:\$?[A-Z]+\$?\d+)?", value.upper()):
+        return False
+    if value in {
+        "header",
+        "group",
+        "col",
+        "ref",
+        "role",
+        "value",
+        "row",
+        "path",
+        "notes",
+        "table_type",
+        "table_range",
+        "title_ranges",
+        "header_ranges",
+        "data_row_range",
+        "hierarchy_columns",
+        "value_columns",
+        "hierarchy_fill_down",
+        "validation_warnings",
+        "coverage",
+        "data_rows",
+        "expected_cells",
+        "covered_cells",
+        "missing_cells",
+        "skipped_rows",
+        "is_complete",
+    }:
+        return False
+    return True
 
 
 def _try_parse_json_like(text: str) -> Any:
